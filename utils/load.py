@@ -51,8 +51,7 @@ def _load_csv(
         output_dir.mkdir(parents=True, exist_ok=True)
     except (IOError, OSError, PermissionError) as e:
         raise RuntimeError(f"Failed to create output directory '{output_dir}': {e}") from e
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-    output_path = output_dir / f"{timestamp}.csv"
+    output_path = output_dir / f"output.csv"
     written = 0
     try:
         with output_path.open("w", newline="", encoding="utf-8") as f:
