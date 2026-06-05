@@ -1,0 +1,6 @@
+[project]
+name = "simple-etl-pipeline"
+version = "0.1.0"
+
+[tool.pyright]
+include = ["utils", "tests"]
