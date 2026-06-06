@@ -1,7 +1,7 @@
 import csv
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
-import gspread
 import psycopg2
 import pytest
 
@@ -117,36 +117,7 @@ def test_load_csv_is_valid_utf8(tmp_path: Path) -> None:
     assert "Café – Niño 😀" in lines[1]
 
 
-def test_load_unknown_target_raises() -> None:
-    with pytest.raises(ValueError, match="Unknown load target"):
-        load(iter([]), "mongodb")
-
-
-def test_load_csv_missing_output_path_raises() -> None:
-    with pytest.raises(ValueError, match="output_path"):
-        load(iter([]), "csv")
-
-
-
-
-def test_load_gsheet_rejects_bad_credentials(tmp_path: Path) -> None:
-    bogus = tmp_path / "not_a_key.json"
-    bogus.write_text("not json")
-
-    recs = iter([_make_record()])
-
-    with pytest.raises(RuntimeError):
-        load(
-            recs,
-            "gsheet",
-            credentials_file=bogus,
-            spreadsheet_id="fake-id",
-            sheet_name="Sheet1",
-        )
-
-
 def test_load_csv_permission_denied(tmp_path: Path) -> None:
-    """_load_csv wraps PermissionError in RuntimeError."""
     readonly_dir = tmp_path / "readonly"
     readonly_dir.mkdir()
     readonly_dir.chmod(0o444)
@@ -158,31 +129,213 @@ def test_load_csv_permission_denied(tmp_path: Path) -> None:
         load(recs, "csv", output_path=nested)
 
 
-def test_load_gsheet_raises_on_bad_auth(tmp_path: Path) -> None:
-    """Passing a non-existent credentials file raises RuntimeError."""
-    recs = iter([_make_record()])
-    missing = tmp_path / "nonexistent_creds.json"
+def test_load_csv_wraps_oserror_from_open(tmp_path: Path, monkeypatch) -> None:
+    target = tmp_path / "output.csv"
 
-    with pytest.raises(RuntimeError):
+    real_open = Path.open
+
+    def fake_open(self, *args, **kwargs):
+        if self == target:
+            raise OSError("disk full")
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fake_open)
+
+    with pytest.raises(RuntimeError, match="Failed to write CSV"):
+        load(iter([_make_record()]), "csv", output_path=tmp_path)
+
+
+def test_load_unknown_target_raises() -> None:
+    with pytest.raises(ValueError, match="Unknown load target"):
+        load(iter([]), "mongodb")
+
+
+def test_load_csv_missing_output_path_raises() -> None:
+    with pytest.raises(ValueError, match="output_path"):
+        load(iter([]), "csv")
+
+
+def _gsheet_dependencies(monkeypatch, worksheet: MagicMock) -> MagicMock:
+    creds_instance = MagicMock()
+    creds_cls = MagicMock(return_value=creds_instance)
+    monkeypatch.setattr("utils.load.Credentials", creds_cls)
+    monkeypatch.setattr(
+        "utils.load.Credentials.from_service_account_file",
+        MagicMock(return_value=creds_instance),
+    )
+    client = MagicMock()
+    client.open_by_key.return_value.worksheet.return_value = worksheet
+    monkeypatch.setattr("utils.load.gspread.authorize", MagicMock(return_value=client))
+    return creds_cls
+
+
+def test_load_gsheet_writes_rows_and_returns_count(monkeypatch) -> None:
+    worksheet = MagicMock()
+    _gsheet_dependencies(monkeypatch, worksheet)
+
+    recs = iter([_make_record(title="A"), _make_record(title="B")])
+    count = load(
+        recs,
+        "gsheet",
+        credentials_file="creds.json",
+        spreadsheet_id="sheet-id",
+        sheet_name="Sheet1",
+    )
+
+    assert count == 2
+    worksheet.clear.assert_called_once()
+    worksheet.update.assert_called_once()
+    args, _ = worksheet.update.call_args
+    rows = args[0]
+    assert rows[0] == FIELDNAMES
+    assert [row[0] for row in rows[1:]] == ["A", "B"]
+    assert worksheet.format.call_count == 2
+
+
+def test_load_gsheet_skips_number_format_for_empty_input(monkeypatch) -> None:
+    worksheet = MagicMock()
+    _gsheet_dependencies(monkeypatch, worksheet)
+
+    count = load(
+        iter([]),
+        "gsheet",
+        credentials_file="creds.json",
+        spreadsheet_id="sheet-id",
+        sheet_name="Sheet1",
+    )
+
+    assert count == 0
+    worksheet.clear.assert_called_once()
+    worksheet.update.assert_called_once()
+    worksheet.format.assert_not_called()
+
+
+def test_load_gsheet_propagates_underlying_error(monkeypatch) -> None:
+    worksheet = MagicMock()
+    worksheet.update.side_effect = Exception("api quota exceeded")
+    _gsheet_dependencies(monkeypatch, worksheet)
+
+    with pytest.raises(RuntimeError, match="api quota exceeded"):
         load(
-            recs,
+            iter([_make_record()]),
             "gsheet",
-            credentials_file=missing,
-            spreadsheet_id="fake-id",
+            credentials_file="creds.json",
+            spreadsheet_id="sheet-id",
             sheet_name="Sheet1",
         )
 
 
-def test_load_postgresql_connection_refused_raises_runtime_error() -> None:
-    recs = iter([_make_record()])
-    with pytest.raises(RuntimeError):
+def test_load_gsheet_uses_real_credentials_call(monkeypatch, tmp_path: Path) -> None:
+    creds_file = tmp_path / "creds.json"
+    creds_file.write_text("{}")
+
+    worksheet = MagicMock()
+    creds_cls = _gsheet_dependencies(monkeypatch, worksheet)
+
+    load(
+        iter([_make_record()]),
+        "gsheet",
+        credentials_file=creds_file,
+        spreadsheet_id="sheet-id",
+        sheet_name="Sheet1",
+    )
+
+    creds_cls.from_service_account_file.assert_called_once()
+    args, kwargs = creds_cls.from_service_account_file.call_args
+    assert args[0] == str(creds_file)
+    assert "scopes" in kwargs
+
+
+def _mock_postgres(monkeypatch) -> tuple[MagicMock, MagicMock, MagicMock]:
+    conn = MagicMock()
+    cursor = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cursor
+    monkeypatch.setattr("utils.load.psycopg2.connect", MagicMock(return_value=conn))
+    execute_values = MagicMock()
+    monkeypatch.setattr("utils.load.execute_values", execute_values)
+    return conn, cursor, execute_values
+
+
+def test_load_postgresql_writes_rows_and_returns_count(monkeypatch) -> None:
+    conn, cursor, execute_values = _mock_postgres(monkeypatch)
+
+    recs = iter([_make_record(title="A"), _make_record(title="B")])
+    count = load(
+        recs,
+        "postgresql",
+        host="db",
+        port=5432,
+        dbname="etl",
+        user="u",
+        password="p",
+        table="products",
+    )
+
+    assert count == 2
+    cursor.execute.assert_called_once()
+    conn.commit.assert_called_once()
+    conn.close.assert_called_once()
+    execute_values.assert_called_once()
+    insert_sql = execute_values.call_args.args[1]
+    assert "INSERT INTO" in str(insert_sql)
+    assert "VALUES %s" in str(insert_sql)
+    assert execute_values.call_args.args[1]._wrapped[1].string == "products"
+
+
+def test_load_postgresql_empty_input_does_not_call_execute_values(monkeypatch) -> None:
+    conn, cursor, execute_values = _mock_postgres(monkeypatch)
+
+    count = load(
+        iter([]),
+        "postgresql",
+        host="db",
+        dbname="etl",
+        user="u",
+        password="p",
+        table="products",
+    )
+
+    assert count == 0
+    cursor.execute.assert_called_once()
+    execute_values.assert_not_called()
+    conn.commit.assert_called_once()
+    conn.close.assert_called_once()
+
+
+def test_load_postgresql_wraps_operational_error(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "utils.load.psycopg2.connect",
+        MagicMock(side_effect=psycopg2.OperationalError("connection refused")),
+    )
+
+    with pytest.raises(RuntimeError, match="Failed to connect to PostgreSQL"):
         load(
-            recs,
+            iter([_make_record()]),
             "postgresql",
-            host="127.0.0.1",
-            port=65432,
-            dbname="nonexistent",
-            user="nobody",
-            password="nopass",
+            host="db",
+            dbname="etl",
+            user="u",
+            password="p",
             table="products",
         )
+
+
+def test_load_postgresql_closes_connection_on_exception(monkeypatch) -> None:
+    conn = MagicMock()
+    cursor = MagicMock()
+    cursor.execute.side_effect = RuntimeError("schema error")
+    conn.cursor.return_value.__enter__.return_value = cursor
+    monkeypatch.setattr("utils.load.psycopg2.connect", MagicMock(return_value=conn))
+
+    with pytest.raises(RuntimeError):
+        load(
+            iter([_make_record()]),
+            "postgresql",
+            host="db",
+            dbname="etl",
+            user="u",
+            password="p",
+            table="products",
+        )
+
+    conn.close.assert_called_once()
