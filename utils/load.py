@@ -3,25 +3,35 @@ from datetime import datetime, timezone
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
-from utils.transform import TransformedRecord
+
 import gspread
+import pandas as pd
 from google.oauth2.service_account import Credentials
 import psycopg2
 from psycopg2 import sql
 from psycopg2.extras import execute_values
 
-FIELDNAMES = ["title", "price", "rating", "colors", "size", "gender", "timestamp"]
+from utils.transform import TransformedRecord
 
-def _record_to_row(rec: TransformedRecord) -> dict[str, str | float | int | None]:
-    return {
-        "title": rec.title,
-        "price": rec.price,
-        "rating": rec.rating,
-        "colors": rec.colors,
-        "size": rec.size,
-        "gender": rec.gender,
-        "timestamp": rec.timestamp,
-    }
+FIELDNAMES: tuple[str, ...] = ("title", "price", "rating", "colors", "size", "gender", "timestamp")
+
+
+def _records_to_dataframe(records: Iterator[TransformedRecord]) -> pd.DataFrame:
+    rows: list[dict[str, str | float | int | None]] = []
+    for rec in records:
+        rows.append(
+            {
+                "title": rec.title,
+                "price": rec.price,
+                "rating": rec.rating,
+                "colors": rec.colors,
+                "size": rec.size,
+                "gender": rec.gender,
+                "timestamp": rec.timestamp,
+            }
+        )
+    df = pd.DataFrame(rows, columns=pd.Index(FIELDNAMES, name=None))
+    return df
 
 
 def load(records: Iterator[TransformedRecord], target: str, **kwargs: Any) -> int:
@@ -51,18 +61,14 @@ def _load_csv(
         output_dir.mkdir(parents=True, exist_ok=True)
     except (IOError, OSError, PermissionError) as e:
         raise RuntimeError(f"Failed to create output directory '{output_dir}': {e}") from e
-    output_path = output_dir / f"output.csv"
-    written = 0
+
+    output_path = output_dir / "output.csv"
+    df = _records_to_dataframe(records)
     try:
-        with output_path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
-            writer.writeheader()
-            for rec in records:
-                writer.writerow(_record_to_row(rec))
-                written += 1
+        df.to_csv(output_path, index=False, encoding="utf-8")
     except (IOError, OSError, PermissionError) as e:
         raise RuntimeError(f"Failed to write CSV to '{output_path}': {e}") from e
-    return written
+    return len(df)
 
 
 def _load_gsheet(
@@ -80,10 +86,9 @@ def _load_gsheet(
         )
         client = gspread.authorize(creds)
         worksheet = client.open_by_key(spreadsheet_id).worksheet(sheet_name)
-        rows: list[list[str | float | int | None]] = [list(FIELDNAMES)]
-        for rec in records:
-            row = _record_to_row(rec)
-            rows.append([row[field] for field in FIELDNAMES])
+        df = _records_to_dataframe(records)
+        rows: list[list[Any]] = [FIELDNAMES]
+        rows.extend(df.replace({pd.NA: None}).itertuples(index=False, name=None))
         worksheet.clear()
         worksheet.update(rows, "A1")
 
@@ -138,20 +143,10 @@ def _load_postgresql(
                 ).format(sql.Identifier(table))
             )
 
-            data: list[tuple[Any, ...]] = []
-            for rec in records:
-                row = _record_to_row(rec)
-                data.append(
-                    (
-                        row["title"],
-                        row["price"],
-                        row["rating"],
-                        row["colors"],
-                        row["size"],
-                        row["gender"],
-                        row["timestamp"],
-                    )
-                )
+            df = _records_to_dataframe(records)
+            data: list[tuple[Any, ...]] = list(
+                df.replace({pd.NA: None}).itertuples(index=False, name=None)
+            )
 
             if data:
                 execute_values(

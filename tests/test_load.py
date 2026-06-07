@@ -1,6 +1,7 @@
 import csv
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from typing import TypedDict
+from unittest.mock import MagicMock
 
 import psycopg2
 import pytest
@@ -9,8 +10,18 @@ from utils.load import FIELDNAMES, load
 from utils.transform import TransformedRecord
 
 
-def _make_record(**overrides: str | float | int | None) -> TransformedRecord:
-    defaults: dict[str, str | float | int | None] = {
+class _RecordFields(TypedDict, total=False):
+    title: str
+    price: float
+    rating: float | None
+    colors: int | None
+    size: str | None
+    gender: str | None
+    timestamp: str
+
+
+def _make_record(**overrides: _RecordFields) -> TransformedRecord:
+    defaults: _RecordFields = {
         "title": "Test Product",
         "price": 1600000.0,
         "rating": 4.5,
@@ -19,7 +30,7 @@ def _make_record(**overrides: str | float | int | None) -> TransformedRecord:
         "gender": "Unisex",
         "timestamp": "2026-06-05T00:00:00+00:00",
     }
-    return TransformedRecord(**{**defaults, **overrides})  # type: ignore[arg-type]
+    return TransformedRecord(**{**defaults, **overrides})
 
 
 def _find_csv(dir: Path) -> Path:
@@ -65,7 +76,7 @@ def test_load_empty_input_creates_header_only(tmp_path: Path) -> None:
         rows = list(reader)
 
     assert rows == []
-    assert reader.fieldnames == FIELDNAMES
+    assert reader.fieldnames == list(FIELDNAMES)
 
 
 def test_load_writes_none_optionals_as_empty(tmp_path: Path) -> None:
@@ -111,8 +122,9 @@ def test_load_csv_is_valid_utf8(tmp_path: Path) -> None:
 
     output = _find_csv(tmp_path)
     raw = output.read_bytes()
-    assert raw.decode("utf-8")
-    lines = raw.decode("utf-8").strip().split("\r\n")
+    text = raw.decode("utf-8")
+    assert text
+    lines = text.strip().split("\n")
     assert len(lines) == 2
     assert "Café – Niño 😀" in lines[1]
 
@@ -129,20 +141,15 @@ def test_load_csv_permission_denied(tmp_path: Path) -> None:
         load(recs, "csv", output_path=nested)
 
 
-def test_load_csv_wraps_oserror_from_open(tmp_path: Path, monkeypatch) -> None:
-    target = tmp_path / "output.csv"
+def test_load_csv_wraps_oserror_from_write(tmp_path: Path, monkeypatch) -> None:
+    def boom(self, *args, **kwargs):
+        raise OSError("disk full")
 
-    real_open = Path.open
-
-    def fake_open(self, *args, **kwargs):
-        if self == target:
-            raise OSError("disk full")
-        return real_open(self, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "open", fake_open)
+    monkeypatch.setattr("pandas.DataFrame.to_csv", boom)
 
     with pytest.raises(RuntimeError, match="Failed to write CSV"):
         load(iter([_make_record()]), "csv", output_path=tmp_path)
+
 
 
 def test_load_unknown_target_raises() -> None:
@@ -187,7 +194,7 @@ def test_load_gsheet_writes_rows_and_returns_count(monkeypatch) -> None:
     worksheet.update.assert_called_once()
     args, _ = worksheet.update.call_args
     rows = args[0]
-    assert rows[0] == FIELDNAMES
+    assert tuple(rows[0]) == FIELDNAMES
     assert [row[0] for row in rows[1:]] == ["A", "B"]
     assert worksheet.format.call_count == 2
 
