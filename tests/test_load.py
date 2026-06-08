@@ -129,16 +129,20 @@ def test_load_csv_is_valid_utf8(tmp_path: Path) -> None:
     assert "Café – Niño 😀" in lines[1]
 
 
-def test_load_csv_permission_denied(tmp_path: Path) -> None:
-    readonly_dir = tmp_path / "readonly"
-    readonly_dir.mkdir()
-    readonly_dir.chmod(0o444)
+def test_load_csv_permission_denied(tmp_path: Path, monkeypatch) -> None:
+    real_mkdir = Path.mkdir
 
-    recs = iter([_make_record()])
-    nested = readonly_dir / "sub" / "deep"
+    def fake_mkdir(self, *args, **kwargs):
+        raise PermissionError(f"denied: {self}")
 
-    with pytest.raises(RuntimeError, match="Failed to create output directory"):
-        load(recs, "csv", output_path=nested)
+    monkeypatch.setattr(Path, "mkdir", fake_mkdir)
+    try:
+        recs = iter([_make_record()])
+        with pytest.raises(RuntimeError, match="Failed to create output directory"):
+            load(recs, "csv", output_path=tmp_path)
+    finally:
+        monkeypatch.setattr(Path, "mkdir", real_mkdir)
+
 
 
 def test_load_csv_wraps_oserror_from_write(tmp_path: Path, monkeypatch) -> None:
@@ -150,6 +154,15 @@ def test_load_csv_wraps_oserror_from_write(tmp_path: Path, monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="Failed to write CSV"):
         load(iter([_make_record()]), "csv", output_path=tmp_path)
 
+
+def test_load_csv_wraps_permission_error_from_write(tmp_path: Path, monkeypatch) -> None:
+    def boom(self, *args, **kwargs):
+        raise PermissionError("read-only filesystem")
+
+    monkeypatch.setattr("pandas.DataFrame.to_csv", boom)
+
+    with pytest.raises(RuntimeError, match="Failed to write CSV"):
+        load(iter([_make_record()]), "csv", output_path=tmp_path)
 
 
 def test_load_unknown_target_raises() -> None:
